@@ -252,7 +252,7 @@ pub struct TransceiveRequest {
 }
 
 /// Response to a raw NFC exchange.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct TransceiveResponse {
     /// Response bytes. ISO-DEP APDU responses include both status bytes at the end.
     pub data: Vec<u8>,
