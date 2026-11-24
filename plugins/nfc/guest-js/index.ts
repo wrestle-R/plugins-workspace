@@ -399,7 +399,9 @@ function mapScanKind(kind: ScanKind): Record<string, unknown> {
       ndef: {
         ...kindOptions,
         techLists: kind.techLists.map((list) =>
-          list.map((tech) => TechKind[tech])
+          list.map((tech) =>
+            typeof tech === 'number' ? TechKind[Number(tech)] : tech
+          )
         )
       }
     }
