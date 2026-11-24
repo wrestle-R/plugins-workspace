@@ -78,6 +78,32 @@ Denies the scan command without any pre-configured scope.
 <tr>
 <td>
 
+`nfc:allow-transceive`
+
+</td>
+<td>
+
+Enables the transceive command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`nfc:deny-transceive`
+
+</td>
+<td>
+
+Denies the transceive command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `nfc:allow-write`
 
 </td>

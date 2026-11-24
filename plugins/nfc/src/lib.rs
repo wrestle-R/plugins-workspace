@@ -20,6 +20,7 @@ use tauri::{
 
 pub use models::*;
 
+mod commands;
 mod error;
 mod models;
 
@@ -45,6 +46,20 @@ struct WriteRequest {
 }
 
 impl<R: Runtime> Nfc<R> {
+    /// Exchanges a raw command with the tag retained by a successful `tag` scan
+    /// with [`ScanRequest::keep_session_alive`] enabled.
+    ///
+    /// Await each exchange before sending the next command. The tag must stay in range.
+    pub async fn transceive(
+        &self,
+        request: TransceiveRequest,
+    ) -> crate::Result<TransceiveResponse> {
+        self.0
+            .run_mobile_plugin_async("transceive", request)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Checks whether NFC is supported by the device and currently usable by the app.
     ///
     /// On Android this is `false` when the device has no NFC adapter or when NFC is
@@ -110,6 +125,7 @@ impl<R: Runtime, T: Manager<R>> crate::NfcExt<R> for T {
 /// Initializes the plugin.
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
     Builder::new("nfc")
+        .invoke_handler(tauri::generate_handler![commands::transceive])
         .setup(|app, api| {
             #[cfg(target_os = "android")]
             let handle = api.register_android_plugin(PLUGIN_IDENTIFIER, "NfcPlugin")?;

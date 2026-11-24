@@ -467,3 +467,56 @@ export async function isAvailable(): Promise<boolean> {
   )
   return available
 }
+
+/** NFC technologies supported by {@link transceive}. */
+export type TransceiveTechnology =
+  /** ISO-DEP APDU on Android or ISO 7816 APDU on iOS. */
+  | 'isoDep'
+  /** Android NFC-A command. */
+  | 'nfcA'
+  /** Android NFC-V command. */
+  | 'nfcV'
+  /** Native MIFARE command. */
+  | 'miFare'
+  /** iOS ISO 15693 custom command. */
+  | 'iso15693'
+
+/** Arguments to {@link transceive}. */
+export interface TransceiveRequest {
+  technology: TransceiveTechnology
+  /**
+   * Command bytes (integers from 0 through 255). For iOS ISO 15693, supply the
+   * request flags, a custom command code (0xA0–0xDF), and any command parameters.
+   * Core NFC inserts the manufacturer code.
+   */
+  data: number[]
+}
+
+/**
+ * Exchanges a raw command with a tag retained by a successful `tag` scan.
+ *
+ * Enable `nfc:allow-transceive` in your app's Tauri capability. Keep the tag
+ * in range and await each exchange before sending the next command.
+ * The result contains the response bytes, including both status bytes at the
+ * end for ISO-DEP APDUs.
+ *
+ * @example
+ * ```typescript
+ * import { scan, transceive } from '@tauri-apps/plugin-nfc';
+ * await scan({ type: 'tag' }, { keepSessionAlive: true });
+ * const response = await transceive({
+ *   technology: 'isoDep',
+ *   data: [0x00, 0x84, 0x00, 0x00, 0x08]
+ * });
+ * ```
+ *
+ * @since 2.5.0
+ */
+export async function transceive(
+  request: TransceiveRequest
+): Promise<number[]> {
+  const { data } = await invoke<{ data: number[] }>('plugin:nfc|transceive', {
+    request
+  })
+  return data
+}

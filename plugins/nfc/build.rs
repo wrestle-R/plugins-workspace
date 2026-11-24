@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-const COMMANDS: &[&str] = &["is_available", "write", "scan"];
+const COMMANDS: &[&str] = &["is_available", "write", "scan", "transceive"];
 
 fn main() {
     let result = tauri_plugin::Builder::new(COMMANDS)

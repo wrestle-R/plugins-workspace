@@ -12,6 +12,12 @@ import android.nfc.NdefMessage
 import android.nfc.NdefRecord
 import android.nfc.NfcAdapter
 import android.nfc.Tag
+import android.nfc.tech.IsoDep
+import android.nfc.tech.MifareClassic
+import android.nfc.tech.MifareUltralight
+import android.nfc.tech.NfcA
+import android.nfc.tech.NfcV
+import android.nfc.tech.TagTechnology
 import android.nfc.tech.Ndef
 import android.nfc.tech.NdefFormatable
 import android.os.Build
@@ -34,6 +40,7 @@ import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize
 import org.json.JSONArray
 import java.io.IOException
+import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 
 sealed class NfcAction {
@@ -202,14 +209,32 @@ class WriteOptions {
     lateinit var records: Array<NDEFRecordData>
 }
 
+@InvokeArg
+class TransceiveOptions {
+    lateinit var technology: String
+    lateinit var data: ByteArray
+}
+
+internal class RawConnection(
+    val technology: String,
+    val device: TagTechnology,
+    val send: (ByteArray) -> ByteArray
+)
+
 class Session(
     val action: NfcAction,
     val invoke: Invoke,
     val keepAlive: Boolean,
     var tag: Tag? = null,
+    var writing: Boolean = false,
     val filters: Array<IntentFilter>? = null,
     val techLists: Array<Array<String>>? = null
-)
+) {
+    // Accessed only by the raw I/O executor.
+    internal var rawConnection: RawConnection? = null
+    // Accessed under the plugin monitor.
+    internal var usedForRawCommands = false
+}
 
 @TauriPlugin
 class NfcPlugin(private val activity: Activity) : Plugin(activity) {
@@ -217,6 +242,8 @@ class NfcPlugin(private val activity: Activity) : Plugin(activity) {
 
     private var nfcAdapter: NfcAdapter? = null
     private var session: Session? = null
+    private val rawIo = Executors.newSingleThreadExecutor()
+    private var transceiving = false
 
     override fun load(webView: WebView) {
         super.load(webView)
@@ -224,6 +251,7 @@ class NfcPlugin(private val activity: Activity) : Plugin(activity) {
         this.nfcAdapter = NfcAdapter.getDefaultAdapter(activity.applicationContext)
     }
 
+    @Synchronized
     override fun onNewIntent(intent: Intent) {
         Logger.info("NFC", "onNewIntent")
         super.onNewIntent(intent)
@@ -236,25 +264,24 @@ class NfcPlugin(private val activity: Activity) : Plugin(activity) {
         }
 
         extraTag?.let { tag ->
-            session?.let {
-                if (it.keepAlive) {
-                    it.tag = tag
-                }
-            }
+            val current = session ?: return
+            if (current.tag != null || transceiving) return
 
             when (session?.action) {
                 is NfcAction.Read -> readTag(tag, intent)
-                is NfcAction.Write -> thread {
-                    if (session?.action is NfcAction.Write) {
+                is NfcAction.Write -> {
+                    val action = current.action as NfcAction.Write
+                    if (current.writing) return
+                    current.writing = true
+                    thread {
                         try {
-                            writeTag(tag, (session?.action as NfcAction.Write).message)
-                            session?.invoke?.resolve()
+                            writeTag(tag, action.message)
+                            current.invoke.resolve()
                         } catch (e: Exception) {
-                            session?.invoke?.reject(e.toString())
+                            current.invoke.reject(e.toString())
                         } finally {
-                            if (this.session?.keepAlive != true) {
-                                this.session = null
-                                disableNFCInForeground()
+                            synchronized(this) {
+                                if (session === current) session = null
                             }
                         }
                     }
@@ -266,12 +293,15 @@ class NfcPlugin(private val activity: Activity) : Plugin(activity) {
 
     }
 
+    @Synchronized
     override fun onPause() {
+        if (session?.tag != null) clearRetainedTag()
         disableNFCInForeground()
         super.onPause()
         Logger.info("NFC", "onPause")
     }
 
+    @Synchronized
     override fun onResume() {
         super.onResume()
         Logger.info("NFC", "onResume")
@@ -305,7 +335,12 @@ class NfcPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command
+    @Synchronized
     fun scan(invoke: Invoke) {
+        if (transceiving) {
+            invoke.reject("A raw NFC command is already in progress")
+            return
+        }
         val status = isAvailable()
         if (!status.first) {
             invoke.reject("NFC unavailable: " + status.second)
@@ -318,11 +353,24 @@ class NfcPlugin(private val activity: Activity) : Plugin(activity) {
         val techLists = args.kind.techLists()
         enableNFCInForeground(filters, techLists)
 
-        session = Session(NfcAction.Read, invoke, args.keepSessionAlive, null, filters, techLists)
+        session?.let {
+            if (it.writing) {
+                invoke.reject("An NFC write is already in progress")
+                return
+            }
+            if (it.tag == null) it.invoke.reject("NFC session superseded by a new scan")
+        }
+        clearRetainedTag()
+        session = Session(NfcAction.Read, invoke, args.keepSessionAlive, null, filters = filters, techLists = techLists)
     }
 
     @Command
+    @Synchronized
     fun write(invoke: Invoke) {
+        if (transceiving) {
+            invoke.reject("A raw NFC command is already in progress")
+            return
+        }
         val status = isAvailable()
         if (!status.first) {
             invoke.reject("NFC unavailable: " + status.second)
@@ -339,6 +387,10 @@ class NfcPlugin(private val activity: Activity) : Plugin(activity) {
         val message = NdefMessage(ndefRecords.toTypedArray())
 
         session?.let { session ->
+            if (session.usedForRawCommands) {
+                invoke.reject("Start a new scan before writing NDEF to a tag used for raw commands")
+                return
+            }
             session.tag?.let {
                 try {
                     writeTag(it, message)
@@ -359,12 +411,83 @@ class NfcPlugin(private val activity: Activity) : Plugin(activity) {
                 val filters = kind.filters()
                 val techLists = kind.techLists()
                 enableNFCInForeground(filters, techLists)
-                session = Session(NfcAction.Write(message), invoke, true, null, filters, techLists)
+                session = Session(NfcAction.Write(message), invoke, true, null, filters = filters, techLists = techLists)
                 Logger.warn("NFC", "Write Mode Enabled")
             } ?: run {
                 invoke.reject("Missing `kind` for write")
             }
 
+        }
+    }
+
+    @Command
+    @Synchronized
+    fun transceive(invoke: Invoke) {
+        val current = session
+        val tag = current?.tag
+        if (current == null || tag == null || transceiving) {
+            invoke.reject("Scan a tag with keepSessionAlive before transceiving, and await each command")
+            return
+        }
+
+        val args = invoke.parseArgs(TransceiveOptions::class.java)
+        transceiving = true
+        current.usedForRawCommands = true
+        rawIo.execute {
+            val response = runCatching {
+                var connection = current.rawConnection
+                if (connection == null || connection.technology != args.technology) {
+                    closeRawConnection(current)
+                    connection = openRawConnection(tag, args.technology)
+                    current.rawConnection = connection
+                    connection.device.connect()
+                }
+                connection.send(args.data)
+            }
+            if (response.isFailure) closeRawConnection(current)
+            synchronized(this) {
+                transceiving = false
+                if (session !== current) {
+                    invoke.reject("The NFC session ended during transceive")
+                } else {
+                    response.fold(
+                        onSuccess = { bytes ->
+                            invoke.resolve(JSObject().apply { put("data", fromU8Array(bytes)) })
+                        },
+                        onFailure = { error -> invoke.reject(error.message ?: "NFC transceive failed") }
+                    )
+                }
+            }
+        }
+    }
+
+    private fun openRawConnection(tag: Tag, technology: String): RawConnection {
+        fun <T : TagTechnology> connection(tech: T?, send: (T, ByteArray) -> ByteArray): RawConnection {
+            val device = tech ?: throw IOException("The tag does not support the selected NFC technology")
+            return RawConnection(technology, device) { data -> send(device, data) }
+        }
+
+        return when (technology) {
+            "isoDep" -> connection(IsoDep.get(tag), IsoDep::transceive)
+            "nfcA" -> connection(NfcA.get(tag), NfcA::transceive)
+            "nfcV" -> connection(NfcV.get(tag), NfcV::transceive)
+            "miFare" -> MifareUltralight.get(tag)?.let { connection(it, MifareUltralight::transceive) }
+                ?: connection(MifareClassic.get(tag), MifareClassic::transceive)
+            else -> throw IOException("Unsupported Android NFC technology: $technology")
+        }
+    }
+
+    private fun clearRetainedTag() {
+        val current = session ?: return
+        session = null
+        if (current.usedForRawCommands) rawIo.execute { closeRawConnection(current) }
+    }
+
+    private fun closeRawConnection(current: Session) {
+        val connection = current.rawConnection ?: return
+        current.rawConnection = null
+        runCatching { connection.device.close() }.onFailure {
+            Logger.error("failed to close tag", it)
         }
     }
 
@@ -397,6 +520,7 @@ class NfcPlugin(private val activity: Activity) : Plugin(activity) {
             }
         } catch (e: Exception) {
             session?.invoke?.reject("failed to read tag", e)
+            session = null
         } finally {
             if (this.session?.keepAlive != true) {
                 this.session = null
@@ -420,7 +544,10 @@ class NfcPlugin(private val activity: Activity) : Plugin(activity) {
         }
         ret.put("records", JSArray.from(jsonRecords))
 
-        session?.invoke?.resolve(ret)
+        session?.let { current ->
+            if (current.keepAlive) current.tag = tag
+            current.invoke.resolve(ret)
+        }
     }
 
     private fun writeTag(tag: Tag, message: NdefMessage) {
