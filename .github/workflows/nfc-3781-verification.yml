@@ -10,7 +10,7 @@ permissions:
 jobs:
   android:
     name: Android / ${{ matrix.branch }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     strategy:
       fail-fast: false
@@ -34,6 +34,7 @@ jobs:
           java-version: '21'
       - name: Check Rust for Android
         run: cargo check --locked --target aarch64-linux-android -p tauri-plugin-nfc
+      - uses: android-actions/setup-android@v3
       - name: Assemble the NFC Android library and run its unit tests
         run: |
           sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
