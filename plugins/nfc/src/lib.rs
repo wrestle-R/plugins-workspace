@@ -40,8 +40,20 @@ struct IsAvailableResponse {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct WriteRequest {
     records: Vec<NfcRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<ScanKind>,
+    no_platform_sounds: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScanWithOptions {
+    #[serde(flatten)]
+    request: ScanRequest,
+    no_platform_sounds: bool,
 }
 
 impl<R: Runtime> Nfc<R> {
@@ -69,8 +81,23 @@ impl<R: Runtime> Nfc<R> {
     /// Returns an error when NFC is not available (see [`Self::is_available`])
     /// or when the tag could not be read.
     pub fn scan(&self, payload: ScanRequest) -> crate::Result<ScanResponse> {
+        self.scan_with_options(payload, false)
+    }
+
+    /// Scans a tag with optional suppression of Android's discovery sound.
+    pub fn scan_with_options(
+        &self,
+        request: ScanRequest,
+        no_platform_sounds: bool,
+    ) -> crate::Result<ScanResponse> {
         self.0
-            .run_mobile_plugin("scan", payload)
+            .run_mobile_plugin(
+                "scan",
+                ScanWithOptions {
+                    request,
+                    no_platform_sounds,
+                },
+            )
             .map(|v| ScanResponse { tag: v })
             .map_err(Into::into)
     }
@@ -89,8 +116,28 @@ impl<R: Runtime> Nfc<R> {
     /// connected tag on Android, when the tag is read-only, when it cannot hold the message or
     /// when it does not support the NDEF format.
     pub fn write(&self, records: Vec<NfcRecord>) -> crate::Result<()> {
+        self.write_with_options(records, None, false)
+    }
+
+    /// Writes to a retained tag or scans for a tag matching `kind`.
+    ///
+    /// Set `no_platform_sounds` to suppress Android's discovery sound for a new scan.
+    /// Android requires `kind` when there is no retained tag.
+    pub fn write_with_options(
+        &self,
+        records: Vec<NfcRecord>,
+        kind: Option<ScanKind>,
+        no_platform_sounds: bool,
+    ) -> crate::Result<()> {
         self.0
-            .run_mobile_plugin("write", WriteRequest { records })
+            .run_mobile_plugin(
+                "write",
+                WriteRequest {
+                    records,
+                    kind,
+                    no_platform_sounds,
+                },
+            )
             .map_err(Into::into)
     }
 }

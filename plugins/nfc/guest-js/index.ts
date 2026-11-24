@@ -123,6 +123,13 @@ export interface ScanOptions {
    * Defaults to `false`.
    */
   keepSessionAlive?: boolean
+  /**
+   * Suppresses the platform's NFC discovery sound while scanning in reader mode.
+   * Defaults to `false`. **Android only**.
+   *
+   * @since 2.5.0
+   */
+  noPlatformSounds?: boolean
   /** Message displayed in the UI. iOS only. */
   message?: string
   /** Message displayed in the UI when the message has been read. iOS only. */
@@ -136,6 +143,13 @@ export interface WriteOptions {
    * Required on Android unless a {@link scan} session is kept alive.
    */
   kind?: ScanKind
+  /**
+   * Suppresses the platform's NFC discovery sound while scanning in reader mode.
+   * Defaults to `false`. **Android only**.
+   *
+   * @since 2.5.0
+   */
+  noPlatformSounds?: boolean
   /** Message displayed in the UI when reading the tag. iOS only. */
   message?: string
   /** Message displayed in the UI when the tag has been read. iOS only. */
@@ -380,6 +394,16 @@ export function uriRecord(uri: string, id?: string | number[]): NFCRecord {
 
 function mapScanKind(kind: ScanKind): Record<string, unknown> {
   const { type: scanKind, ...kindOptions } = kind
+  if (kind.type === 'ndef' && kind.techLists) {
+    return {
+      ndef: {
+        ...kindOptions,
+        techLists: kind.techLists.map((list) =>
+          list.map((tech) => TechKind[tech])
+        )
+      }
+    }
+  }
   return { [scanKind]: kindOptions }
 }
 

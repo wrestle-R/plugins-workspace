@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt::Display;
 
 /// Arguments of the [`Nfc::scan`](crate::Nfc::scan) API.
@@ -78,12 +78,40 @@ pub struct NfcTagRecord {
 /// An NFC tag that has been scanned.
 #[derive(Deserialize)]
 pub struct NfcTag {
-    /// The tag identifier, as reported by the operating system.
+    /// The tag identifier as a lowercase hexadecimal string.
+    #[serde(deserialize_with = "deserialize_tag_id")]
     pub id: String,
-    /// The technology the tag supports.
+    /// Comma-separated names of the technologies the tag supports.
+    #[serde(deserialize_with = "deserialize_tag_kind")]
     pub kind: String,
     /// The NDEF records stored on the tag. Empty when the tag holds no NDEF message.
     pub records: Vec<NfcTagRecord>,
+}
+
+fn deserialize_tag_id<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum TagId {
+        Text(String),
+        Bytes(Vec<u8>),
+    }
+    Ok(match TagId::deserialize(deserializer)? {
+        TagId::Text(id) => id,
+        TagId::Bytes(bytes) => bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
+    })
+}
+
+fn deserialize_tag_kind<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum TagKind {
+        Text(String),
+        Technologies(Vec<String>),
+    }
+    Ok(match TagKind::deserialize(deserializer)? {
+        TagKind::Text(kind) => kind,
+        TagKind::Technologies(technologies) => technologies.join(","),
+    })
 }
 
 /// Response of the [`Nfc::scan`](crate::Nfc::scan) API.
@@ -98,6 +126,7 @@ pub struct ScanResponse {
 /// Every field is optional and only the ones that are set take part in the filter.
 /// **Android only**: the iOS implementation ignores this filter.
 #[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UriFilter {
     /// Only match URIs with this scheme, e.g. `https`.
     scheme: Option<String>,
@@ -166,7 +195,7 @@ impl Serialize for TechKind {
 
 /// The kind of scan to perform, which defines which tags are matched.
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ScanKind {
     /// Only match tags that carry an NDEF message.
     Ndef {
@@ -183,6 +212,7 @@ pub enum ScanKind {
         /// **Android only**. See
         /// <https://developer.android.com/reference/android/nfc/NfcAdapter#ACTION_TECH_DISCOVERED>
         /// for more information.
+        #[serde(rename = "techLists")]
         tech_list: Option<Vec<Vec<TechKind>>>,
     },
     /// Match any tag that is discovered, whether it carries an NDEF message or not.

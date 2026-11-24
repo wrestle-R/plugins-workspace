@@ -5,18 +5,12 @@
 package app.tauri.nfc
 
 import android.app.Activity
-import android.app.PendingIntent
-import android.content.Intent
-import android.content.IntentFilter
 import android.nfc.NdefMessage
 import android.nfc.NdefRecord
 import android.nfc.NfcAdapter
 import android.nfc.Tag
 import android.nfc.tech.Ndef
 import android.nfc.tech.NdefFormatable
-import android.os.Build
-import android.os.Parcelable
-import android.os.PatternMatcher
 import android.webkit.WebView
 import app.tauri.Logger
 import app.tauri.annotation.Command
@@ -97,23 +91,6 @@ enum class TechKind(@JsonValue val value: String) {
     }
 }
 
-private fun addDataFilters(intentFilter: IntentFilter, uri: UriFilter?, mimeType: String?) {
-    uri?.let { it -> {
-        it.scheme?.let {
-            intentFilter.addDataScheme(it)
-        }
-        it.host?.let {
-            intentFilter.addDataAuthority(it, null)
-        }
-        it.pathPrefix?.let {
-            intentFilter.addDataPath(it, PatternMatcher.PATTERN_PREFIX)
-        }
-    }}
-    mimeType?.let {
-        intentFilter.addDataType(it)
-    }
-}
-
 @InvokeArg
 @JsonDeserialize(using = ScanKindDeserializer::class)
 sealed class ScanKind {
@@ -127,21 +104,6 @@ sealed class ScanKind {
         var mimeType: String? = null
         var uri: UriFilter? = null
         var techLists: Array<Array<TechKind>>? = null
-    }
-
-    fun filters(): Array<IntentFilter>? {
-        return when (this) {
-            is Tag -> {
-                val intentFilter = IntentFilter(NfcAdapter.ACTION_TAG_DISCOVERED)
-                addDataFilters(intentFilter, uri, mimeType)
-                arrayOf(intentFilter)
-            }
-            is Ndef -> {
-                val intentFilter = IntentFilter(if (techLists == null) NfcAdapter.ACTION_NDEF_DISCOVERED else NfcAdapter.ACTION_TECH_DISCOVERED)
-                addDataFilters(intentFilter, uri, mimeType)
-                arrayOf(intentFilter)
-            }
-        }
     }
 
     fun techLists(): Array<Array<String>>? {
@@ -158,8 +120,6 @@ sealed class ScanKind {
                         techs.add(list.toTypedArray())
                     }
                     techs.toTypedArray()
-                } ?: run {
-                    null
                 }
             }
         }
@@ -186,6 +146,7 @@ internal class ScanKindDeserializer: JsonDeserializer<ScanKind>() {
 class ScanOptions {
     lateinit var kind: ScanKind
     var keepSessionAlive: Boolean = false
+    var noPlatformSounds: Boolean = false
 }
 
 @InvokeArg
@@ -200,74 +161,47 @@ class NDEFRecordData {
 class WriteOptions {
     var kind: ScanKind? = null
     lateinit var records: Array<NDEFRecordData>
+    var noPlatformSounds: Boolean = false
 }
 
 class Session(
     val action: NfcAction,
-    val invoke: Invoke,
+    var invoke: Invoke?,
     val keepAlive: Boolean,
     var tag: Tag? = null,
-    val filters: Array<IntentFilter>? = null,
-    val techLists: Array<Array<String>>? = null
+    val kind: ScanKind? = null,
+    val readerModeFlags: Int = NfcReaderHelper.readerModeFlags(false),
+    var writing: Boolean = false
 )
 
 @TauriPlugin
 class NfcPlugin(private val activity: Activity) : Plugin(activity) {
-    private lateinit var webView: WebView
-
     private var nfcAdapter: NfcAdapter? = null
     private var session: Session? = null
+    private val sessionLock = Any()
+
+    // Accessed only on the activity thread.
+    private var readerSession: Session? = null
+    private var paused = false
+
+    private fun onTagDiscovered(currentSession: Session, tag: Tag) {
+        synchronized(sessionLock) {
+            if (session !== currentSession || currentSession.invoke == null) return
+        }
+        when (val action = currentSession.action) {
+            is NfcAction.Read -> handleDiscoveredRead(currentSession, tag)
+            is NfcAction.Write -> handleDiscoveredWrite(currentSession, tag, action.message)
+        }
+    }
 
     override fun load(webView: WebView) {
         super.load(webView)
-        this.webView = webView
         this.nfcAdapter = NfcAdapter.getDefaultAdapter(activity.applicationContext)
     }
 
-    override fun onNewIntent(intent: Intent) {
-        Logger.info("NFC", "onNewIntent")
-        super.onNewIntent(intent)
-
-        val extraTag = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            intent.getParcelableExtra(NfcAdapter.EXTRA_TAG, Tag::class.java)
-        } else {
-            @Suppress("DEPRECATION")
-            intent.getParcelableExtra(NfcAdapter.EXTRA_TAG)
-        }
-
-        extraTag?.let { tag ->
-            session?.let {
-                if (it.keepAlive) {
-                    it.tag = tag
-                }
-            }
-
-            when (session?.action) {
-                is NfcAction.Read -> readTag(tag, intent)
-                is NfcAction.Write -> thread {
-                    if (session?.action is NfcAction.Write) {
-                        try {
-                            writeTag(tag, (session?.action as NfcAction.Write).message)
-                            session?.invoke?.resolve()
-                        } catch (e: Exception) {
-                            session?.invoke?.reject(e.toString())
-                        } finally {
-                            if (this.session?.keepAlive != true) {
-                                this.session = null
-                                disableNFCInForeground()
-                            }
-                        }
-                    }
-                }
-
-                else -> {}
-            }
-        }
-
-    }
-
     override fun onPause() {
-        disableNFCInForeground()
+        paused = true
+        updateReaderMode()
         super.onPause()
         Logger.info("NFC", "onPause")
     }
@@ -275,9 +209,8 @@ class NfcPlugin(private val activity: Activity) : Plugin(activity) {
     override fun onResume() {
         super.onResume()
         Logger.info("NFC", "onResume")
-        session?.let {
-            enableNFCInForeground(it.filters, it.techLists)
-        }
+        paused = false
+        updateReaderMode()
     }
 
     private fun isAvailable(): Pair<Boolean, String?> {
@@ -313,12 +246,27 @@ class NfcPlugin(private val activity: Activity) : Plugin(activity) {
         }
 
         val args = invoke.parseArgs(ScanOptions::class.java)
+        val flags = NfcReaderHelper.readerModeFlags(args.noPlatformSounds)
 
-        val filters = args.kind.filters()
-        val techLists = args.kind.techLists()
-        enableNFCInForeground(filters, techLists)
+        val previousInvoke = synchronized(sessionLock) {
+            if (session?.writing == true) {
+                invoke.reject("An NFC write is already in progress")
+                return
+            }
+            val prev = session?.invoke
+            session = Session(
+                NfcAction.Read,
+                invoke,
+                args.keepSessionAlive,
+                null,
+                args.kind,
+                flags
+            )
+            prev
+        }
+        previousInvoke?.reject("Scan superseded by a new scan")
 
-        session = Session(NfcAction.Read, invoke, args.keepSessionAlive, null, filters, techLists)
+        updateReaderMode()
     }
 
     @Command
@@ -338,89 +286,143 @@ class NfcPlugin(private val activity: Activity) : Plugin(activity) {
 
         val message = NdefMessage(ndefRecords.toTypedArray())
 
-        session?.let { session ->
-            session.tag?.let {
-                try {
-                    writeTag(it, message)
-                    invoke.resolve()
-                } catch (e: Exception) {
-                    invoke.reject(e.toString())
-                } finally {
-                    if (this.session?.keepAlive != true) {
-                        this.session = null
-                        disableNFCInForeground()
-                    }
+        val retainedTag = synchronized(sessionLock) {
+            val current = session
+            if (current != null) {
+                val tag = current.tag
+                if (tag == null || current.writing) {
+                    invoke.reject("NFC session is busy or has no connected tag")
+                    return
                 }
-            } ?: run {
-                invoke.reject("connected tag not found, please wait for it to be available and then call write()")
-            }
-        } ?: run {
-            args.kind?.let { kind ->
-                val filters = kind.filters()
-                val techLists = kind.techLists()
-                enableNFCInForeground(filters, techLists)
-                session = Session(NfcAction.Write(message), invoke, true, null, filters, techLists)
-                Logger.warn("NFC", "Write Mode Enabled")
-            } ?: run {
-                invoke.reject("Missing `kind` for write")
-            }
-
-        }
-    }
-
-    private fun readTag(tag: Tag, intent: Intent) {
-        try {
-            val rawMessages = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                intent.getParcelableArrayExtra(NfcAdapter.EXTRA_NDEF_MESSAGES, Parcelable::class.java)
+                current.writing = true
+                Pair(current, tag)
             } else {
-                @Suppress("DEPRECATION")
-                intent.getParcelableArrayExtra(NfcAdapter.EXTRA_NDEF_MESSAGES)
+                val kind = args.kind
+                if (kind == null) {
+                    invoke.reject("Missing `kind` for write")
+                    return
+                }
+                session = Session(
+                    NfcAction.Write(message), invoke, false, null, kind,
+                    NfcReaderHelper.readerModeFlags(args.noPlatformSounds)
+                )
+                null
+            }
+        }
+        if (retainedTag != null) {
+            val (current, tag) = retainedTag
+            thread {
+                val result = runCatching { writeTag(tag, message) }
+                synchronized(sessionLock) { current.writing = false }
+                result.fold(
+                    onSuccess = { invoke.resolve() },
+                    onFailure = { invoke.reject(it.toString()) }
+                )
+            }
+            return
+        }
+
+        updateReaderMode()
+        Logger.warn("NFC", "Write Mode Enabled")
+    }
+
+    private fun readNdefMessage(tag: Tag): Pair<Ndef?, NdefMessage?> {
+        val ndef = Ndef.get(tag) ?: return Pair(null, null)
+        var message = ndef.cachedNdefMessage
+        if (message == null) {
+            try {
+                ndef.connect()
+                message = ndef.ndefMessage
+            } catch (_: Exception) {
+                // Tag may be unformatted or unreadable as NDEF
+            } finally {
+                try {
+                    if (ndef.isConnected) {
+                        ndef.close()
+                    }
+                } catch (_: IOException) {
+                }
+            }
+        }
+        return Pair(ndef, message)
+    }
+
+    private fun handleDiscoveredRead(currentSession: Session, tag: Tag) {
+        val invokeToResolve: Invoke
+        try {
+            val (ndef, ndefMessage) = readNdefMessage(tag)
+            val kind = currentSession.kind
+            if (kind != null && !NfcReaderHelper.matchesTag(tag, kind, ndef, ndefMessage)) {
+                return
             }
 
-            when (intent.action) {
-                NfcAdapter.ACTION_NDEF_DISCOVERED -> {
-                    // For some reason this one never triggers.
-                    Logger.info("NFC", "new NDEF intent")
-                    readTagInner(tag, rawMessages)
+            val records = ndefMessage?.records ?: arrayOf()
+            val jsonRecords = Array(records.size) { i -> recordToJson(records[i]) }
+
+            val ret = JSObject()
+            ret.put("id", fromU8Array(tag.id))
+            ret.put("kind", JSArray.from(tag.techList))
+            ret.put("records", JSArray.from(jsonRecords))
+
+            synchronized(sessionLock) {
+                if (session !== currentSession || currentSession.invoke == null) {
+                    return
                 }
-                NfcAdapter.ACTION_TECH_DISCOVERED -> {
-                    // For some reason this always triggers instead of NDEF_DISCOVERED even though we set ndef filters right now
-                    Logger.info("NFC", "new TECH intent")
-                    // TODO: handle different techs. Don't assume ndef.
-                    readTagInner(tag, rawMessages)
-                }
-                NfcAdapter.ACTION_TAG_DISCOVERED -> {
-                    // This should never trigger when an app handles NDEF and TECH
-                    // TODO: Don't assume ndef.
-                    readTagInner(tag, rawMessages)
+                invokeToResolve = currentSession.invoke!!
+                currentSession.invoke = null
+                if (currentSession.keepAlive) {
+                    currentSession.tag = tag
+                } else {
+                    session = null
                 }
             }
+
+            if (!currentSession.keepAlive) {
+                updateReaderMode()
+            }
+            invokeToResolve.resolve(ret)
         } catch (e: Exception) {
-            session?.invoke?.reject("failed to read tag", e)
-        } finally {
-            if (this.session?.keepAlive != true) {
-                this.session = null
+            val invokeToReject = synchronized(sessionLock) {
+                if (session === currentSession) {
+                    val inv = currentSession.invoke
+                    currentSession.invoke = null
+                    session = null
+                    inv
+                } else {
+                    null
+                }
             }
-            // TODO this crashes? disableNFCInForeground()
+            updateReaderMode()
+            invokeToReject?.reject("failed to read tag", e)
         }
     }
 
-    private fun readTagInner(tag: Tag?, rawMessages: Array<Parcelable>?) {
-        val ndefMessage = rawMessages?.get(0) as NdefMessage?
-
-        val records = ndefMessage?.records ?: arrayOf()
-
-        val jsonRecords = Array(records.size) { i -> recordToJson(records[i]) }
-
-        val ret = JSObject()
-        if (tag !== null) {
-            ret.put("id", fromU8Array(tag.id))
-            // TODO There's also ndef.type which returns the ndef spec type which may be interesting to know too?
-            ret.put("kind", JSArray.from(tag.techList))
+    private fun handleDiscoveredWrite(currentSession: Session, tag: Tag, message: NdefMessage) {
+        val kind = currentSession.kind
+        if (kind != null) {
+            val (ndef, ndefMessage) = readNdefMessage(tag)
+            if (!NfcReaderHelper.matchesTag(tag, kind, ndef, ndefMessage)) {
+                return
+            }
         }
-        ret.put("records", JSArray.from(jsonRecords))
 
-        session?.invoke?.resolve(ret)
+        val invokeToSettle = synchronized(sessionLock) {
+            if (session !== currentSession || currentSession.writing) return
+            val pending = currentSession.invoke ?: return
+            currentSession.writing = true
+            currentSession.invoke = null
+            pending
+        }
+
+        val result = runCatching { writeTag(tag, message) }
+        synchronized(sessionLock) {
+            if (session === currentSession) session = null
+        }
+        updateReaderMode()
+        result.fold(
+            onSuccess = { invokeToSettle.resolve() },
+            onFailure = { invokeToSettle.reject(it.toString()) }
+        )
     }
 
     private fun writeTag(tag: Tag, message: NdefMessage) {
@@ -434,22 +436,24 @@ class NfcPlugin(private val activity: Activity) : Plugin(activity) {
                 throw Exception("Couldn't connect to NFC tag", e)
             }
 
-            if (ndefTag.maxSize < message.toByteArray().size) {
-                throw Exception("The message is too large for the provided NFC tag")
-            } else if (!ndefTag.isWritable) {
-                throw Exception("NFC tag is read-only")
-            } else {
-                try {
-                    ndefTag.writeNdefMessage(message)
-                } catch (e: Exception) {
-                    throw Exception("Couldn't write message to NFC tag", e)
-                }
-            }
-
             try {
-                ndefTag.close()
-            } catch (e: IOException) {
-                Logger.error("failed to close tag", e)
+                if (ndefTag.maxSize < message.toByteArray().size) {
+                    throw Exception("The message is too large for the provided NFC tag")
+                } else if (!ndefTag.isWritable) {
+                    throw Exception("NFC tag is read-only")
+                } else {
+                    try {
+                        ndefTag.writeNdefMessage(message)
+                    } catch (e: Exception) {
+                        throw Exception("Couldn't write message to NFC tag", e)
+                    }
+                }
+            } finally {
+                try {
+                    ndefTag.close()
+                } catch (e: IOException) {
+                    Logger.error("failed to close tag", e)
+                }
             }
 
             return
@@ -463,12 +467,12 @@ class NfcPlugin(private val activity: Activity) : Plugin(activity) {
                 ndefFormatableTag.format(message)
             } catch (e: Exception) {
                 throw Exception("Couldn't format tag as Ndef", e)
-            }
-
-            try {
-                ndefFormatableTag.close()
-            } catch (e: IOException) {
-                Logger.error("failed to close tag", e)
+            } finally {
+                try {
+                    ndefFormatableTag.close()
+                } catch (e: IOException) {
+                    Logger.error("failed to close tag", e)
+                }
             }
 
             return
@@ -478,25 +482,19 @@ class NfcPlugin(private val activity: Activity) : Plugin(activity) {
         throw Exception("Tag doesn't support Ndef format")
     }
 
-    // TODO: Use ReaderMode instead of ForegroundDispatch
-    private fun enableNFCInForeground(filters: Array<IntentFilter>?, techLists: Array<Array<String>>?) {
-        val flag =
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE else PendingIntent.FLAG_UPDATE_CURRENT
-        val pendingIntent = PendingIntent.getActivity(
-            activity, 0,
-            Intent(
-                activity,
-                activity.javaClass
-            ).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
-            flag
-        )
-
-        nfcAdapter?.enableForegroundDispatch(activity, pendingIntent, filters, techLists)
-    }
-
-    private fun disableNFCInForeground() {
+    private fun updateReaderMode() {
         activity.runOnUiThread {
-            nfcAdapter?.disableForegroundDispatch(activity)
+            if (activity.isDestroyed || activity.isFinishing) return@runOnUiThread
+            val desired = if (paused) null else synchronized(sessionLock) { session }
+            if (readerSession === desired) return@runOnUiThread
+            if (desired == null) {
+                nfcAdapter?.disableReaderMode(activity)
+            } else {
+                nfcAdapter?.enableReaderMode(
+                    activity, { tag -> onTagDiscovered(desired, tag) }, desired.readerModeFlags, null
+                )
+            }
+            readerSession = desired
         }
     }
 }
@@ -504,7 +502,7 @@ class NfcPlugin(private val activity: Activity) : Plugin(activity) {
 private fun fromU8Array(byteArray: ByteArray): JSONArray {
     val json = JSONArray()
     for (byte in byteArray) {
-        json.put(byte)
+        json.put(byte.toInt() and 0xFF)
     }
     return json
 }
