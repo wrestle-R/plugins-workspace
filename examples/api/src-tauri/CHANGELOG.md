@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.0.59]
+
+### Dependencies
+
+- Upgraded to `http@2.9.1`
+- Upgraded to `notification@2.8.2`
+
 ## [2.0.58]
 
 ### Dependencies

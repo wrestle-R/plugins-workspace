@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.0.55]
+
+### Dependencies
+
+- Upgraded to `http-js@2.9.1`
+- Upgraded to `notification-js@2.8.2`
+
 ## [2.0.54]
 
 ### Dependencies
