@@ -17,7 +17,7 @@ jobs:
       matrix:
         include:
           - branch: feat/nfc-android-reader-mode
-            commit: b18eb5f57e90f65185bc2366f2c33a99a8ab475e
+            commit: 767ee6186a37491e1117694ba427f22463e7f851
           - branch: feat/nfc-raw-transceive
             commit: 8b5a5170f5dbbe8f7b8500372a04e9d261e5dcb4
     steps:
@@ -34,10 +34,11 @@ jobs:
           java-version: '21'
       - name: Check Rust for Android
         run: cargo check --locked --target aarch64-linux-android -p tauri-plugin-nfc
-      - uses: android-actions/setup-android@v3
       - name: Assemble the NFC Android library and run its unit tests
         run: |
-          sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+          android_sdk=${ANDROID_HOME:-/usr/local/lib/android/sdk}
+          export ANDROID_HOME="$android_sdk"
+          "$android_sdk/cmdline-tools/latest/bin/sdkmanager" 'platforms;android-36' 'build-tools;36.0.0'
           gradle_project=$(mktemp -d)
           tauri_android=$(find "$HOME/.cargo/registry/src" -path '*/tauri-2.12.5/mobile/android' -type d -print -quit)
           test -d "$tauri_android"
