@@ -1,0 +1,59 @@
+name: NFC issue 3781 verification
+
+on:
+  push:
+    branches: [ci/nfc-3781-verification]
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: [feat/nfc-android-reader-mode, feat/nfc-raw-transceive]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ matrix.branch }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          targets: aarch64-linux-android
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Check Rust for Android
+        run: cargo check --locked --target aarch64-linux-android -p tauri-plugin-nfc
+      - name: Assemble the NFC Android library and run its unit tests
+        run: |
+          sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+          gradle_project=$(mktemp -d)
+          tauri_android=$(find "$HOME/.cargo/registry/src" -path '*/tauri-2.12.5/mobile/android' -type d -print -quit)
+          test -d "$tauri_android"
+          cp examples/api/src-tauri/gen/android/{build.gradle.kts,gradle.properties} "$gradle_project"
+          cat > "$gradle_project/settings.gradle" <<EOF
+          rootProject.name = 'nfc-verification'
+          include ':nfc', ':tauri-android'
+          project(':nfc').projectDir = file('$PWD/plugins/nfc/android')
+          project(':tauri-android').projectDir = file('$tauri_android')
+          EOF
+          bash examples/api/src-tauri/gen/android/gradlew -p "$gradle_project" :nfc:assembleDebug :nfc:testDebugUnitTest
+
+  ios:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: feat/nfc-raw-transceive
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          targets: aarch64-apple-ios
+      - name: Build the NFC plugin and Core NFC Swift package
+        run: cargo build --locked --target aarch64-apple-ios -p tauri-plugin-nfc
