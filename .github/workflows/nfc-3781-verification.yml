@@ -9,16 +9,21 @@ permissions:
 
 jobs:
   android:
+    name: Android / ${{ matrix.branch }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        branch: [feat/nfc-android-reader-mode, feat/nfc-raw-transceive]
+        include:
+          - branch: feat/nfc-android-reader-mode
+            commit: b18eb5f57e90f65185bc2366f2c33a99a8ab475e
+          - branch: feat/nfc-raw-transceive
+            commit: 8b5a5170f5dbbe8f7b8500372a04e9d261e5dcb4
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ matrix.branch }}
+          ref: ${{ matrix.commit }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.90.0
         with:
@@ -50,7 +55,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: feat/nfc-raw-transceive
+          ref: 8b5a5170f5dbbe8f7b8500372a04e9d261e5dcb4
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.90.0
         with:
